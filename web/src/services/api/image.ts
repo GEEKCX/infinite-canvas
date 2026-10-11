@@ -1,6 +1,6 @@
 import axios from "axios";
 
-import { buildApiUrl, resolveModelRequestConfig, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, resolveModelRequestConfig, modelOptionName, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
@@ -91,6 +91,19 @@ type GeminiPayload = {
 };
 type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string };
 type RequestOptions = { signal?: AbortSignal };
+
+// ── RunningHub types ──────────────────────────────────────────
+type RunningHubTaskStatus = "QUEUED" | "RUNNING" | "SUCCESS" | "FAILED";
+type RunningHubResultItem = { url?: string; nodeId?: string; outputType?: string; text?: string | null };
+type RunningHubSubmitResponse = { taskId?: string; status?: RunningHubTaskStatus; errorCode?: string; errorMessage?: string };
+type RunningHubQueryResponse = {
+    taskId?: string;
+    status?: RunningHubTaskStatus;
+    errorCode?: string;
+    errorMessage?: string;
+    results?: RunningHubResultItem[];
+    usage?: { consumeMoney?: string | null; consumeCoins?: string | null; taskCostTime?: string };
+};
 
 const QUALITY_BASE: Record<string, number> = {
     low: 1024,
@@ -248,9 +261,10 @@ function parseImagePayload(payload: ImageApiResponse) {
 
 function readAxiosError(error: unknown, fallback: string) {
     if (axios.isCancel(error)) return "请求已取消";
-    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; code?: number }>(error)) {
+    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; code?: number; errorMessage?: string; errorCode?: string }>(error)) {
         const responseData = error.response?.data;
-        return responseData?.msg || responseData?.error?.message || readStatusError(error.response?.status, fallback);
+        const runningHubMsg = responseData?.errorMessage ? `RunningHub：${responseData.errorMessage}` : "";
+        return runningHubMsg || responseData?.msg || responseData?.error?.message || readStatusError(error.response?.status, fallback);
     }
     if (error instanceof DOMException && error.name === "AbortError") return "请求已取消";
     return error instanceof Error ? error.message : fallback;
@@ -648,6 +662,164 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
     return images;
 }
 
+// ── RunningHub (异步任务模式，通过 Serverless Proxy 绕过 CORS) ───
+
+const RUNNINGHUB_POLL_INTERVAL = 3000;
+const RUNNINGHUB_MAX_POLL_ATTEMPTS = 120;
+const RUNNINGHUB_PROXY = "/api/runninghub";
+
+/** 从模型名（可含中文后缀）中解析出 RunningHub 模型 ID 和端点类型 */
+function parseRunningHubModel(rawModel: string): { modelId: string; endpoint: string } {
+    const normalized = modelOptionName(rawModel || "");
+    if (normalized.includes("（图生图）")) {
+        return { modelId: normalized.replace("（图生图）", "").trim(), endpoint: "image-to-image" };
+    }
+    return { modelId: normalized.replace("（文生图）", "").trim(), endpoint: "text-to-image" };
+}
+
+/** 构建 RunningHub API 路径（不含域名），例如 /openapi/v2/rhart-image-g-2/text-to-image */
+function runningHubEndpoint(config: { model: string }) {
+    const { modelId, endpoint } = parseRunningHubModel(config.model || "");
+    return `/openapi/v2/${modelId}/${endpoint}`;
+}
+
+/** 通用代理请求：POST → /api/runninghub → RunningHub */
+async function runningHubProxyPost<T>(apiKey: string, endpoint: string, body: unknown, options?: { signal?: AbortSignal; contentType?: string }) {
+    const headers: Record<string, string> = {
+        "x-runninghub-endpoint": endpoint,
+        "x-runninghub-auth": `Bearer ${apiKey}`,
+    };
+    if (options?.contentType) {
+        headers["Content-Type"] = options.contentType;
+    }
+    const response = await axios.post<T>(RUNNINGHUB_PROXY, body, {
+        headers,
+        signal: options?.signal,
+    });
+    return response.data;
+}
+
+function resolveRunningHubAspectRatio(size: string): string | undefined {
+    if (!size || size.toLowerCase() === "auto") return undefined;
+    const supported = ["1:1", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9", "3:4", "4:3", "9:21", "1:2", "2:1", "1:3", "3:1"];
+    const exact = supported.find((s) => s === size);
+    if (exact) return exact;
+    return undefined;
+}
+
+function resolveRunningHubResolution(quality: string | undefined): string | undefined {
+    if (!quality) return undefined;
+    const normalized = normalizeQuality(quality);
+    if (!normalized) return undefined;
+    const resolutionMap: Record<string, string> = { low: "1k", medium: "2k", high: "4k", standard: "1k", hd: "2k" };
+    return resolutionMap[normalized];
+}
+
+/** 上传本地图片到 RunningHub，返回可访问的 URL */
+async function uploadImageToRunningHub(config: Pick<AiConfig, "apiKey">, blob: Blob, fileName: string): Promise<string> {
+    const formData = new FormData();
+    formData.append("file", blob, fileName);
+    const data = await runningHubProxyPost<{ code?: number; message?: string; data?: { download_url?: string } }>(
+        config.apiKey,
+        "/openapi/v2/media/upload/binary",
+        formData,
+    );
+    if (data.code !== 0 || !data.data?.download_url) {
+        throw new Error(data.message || "RunningHub 图片上传失败");
+    }
+    return data.data.download_url;
+}
+
+async function submitRunningHubTask(config: AiConfig, prompt: string, options?: RequestOptions): Promise<string> {
+    return submitRunningHubTaskInternal(config, prompt, [], options);
+}
+
+async function submitRunningHubEditTask(config: AiConfig, prompt: string, imageUrls: string[], options?: RequestOptions): Promise<string> {
+    return submitRunningHubTaskInternal(config, prompt, imageUrls, options);
+}
+
+async function submitRunningHubTaskInternal(config: AiConfig, prompt: string, imageUrls: string[], options?: RequestOptions): Promise<string> {
+    const aspectRatio = resolveRunningHubAspectRatio(config.size);
+    const resolution = resolveRunningHubResolution(config.quality);
+    const body: Record<string, unknown> = { prompt: withSystemPrompt(config, prompt) };
+    if (aspectRatio) body.aspectRatio = aspectRatio;
+    if (resolution) body.resolution = resolution;
+    if (imageUrls.length) body.imageUrls = imageUrls;
+
+    const data = await runningHubProxyPost<RunningHubSubmitResponse>(
+        config.apiKey,
+        runningHubEndpoint(config),
+        body,
+        { signal: options?.signal },
+    );
+
+    if (!data.taskId) {
+        throw new Error(data.errorMessage || "RunningHub 接口没有返回任务 ID");
+    }
+    return data.taskId;
+}
+
+async function pollRunningHubTask(config: Pick<AiConfig, "apiKey">, taskId: string, options?: RequestOptions): Promise<RunningHubQueryResponse> {
+    return runningHubProxyPost<RunningHubQueryResponse>(
+        config.apiKey,
+        "/openapi/v2/query",
+        { taskId },
+        { signal: options?.signal },
+    );
+}
+
+async function requestRunningHubImages(config: AiConfig, prompt: string, options?: RequestOptions) {
+    return runRunningHubTaskLoop(config, () => submitRunningHubTask(config, prompt, options), options);
+}
+
+async function requestRunningHubEdit(config: AiConfig, prompt: string, imageUrls: string[], options?: RequestOptions) {
+    return runRunningHubTaskLoop(config, () => submitRunningHubEditTask(config, prompt, imageUrls, options), options);
+}
+
+/** 公用的任务提交+轮询循环 */
+async function runRunningHubTaskLoop(config: AiConfig, submit: () => Promise<string>, options?: RequestOptions) {
+    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+
+    // Step 1: 提交任务
+    const taskId = await submit();
+
+    // Step 2: 轮询结果
+    for (let attempt = 0; attempt < RUNNINGHUB_MAX_POLL_ATTEMPTS; attempt++) {
+        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        const result = await pollRunningHubTask(requestConfig, taskId, options);
+
+        if (result.status === "SUCCESS") {
+            const items = (result.results || []).filter((item) => item.url);
+            if (!items.length) throw new Error("RunningHub 接口没有返回图片");
+            return items.map((item) => ({ id: nanoid(), dataUrl: item.url! }));
+        }
+
+        if (result.status === "FAILED") {
+            throw new Error(result.errorMessage || "RunningHub 图片生成失败");
+        }
+
+        if (attempt === RUNNINGHUB_MAX_POLL_ATTEMPTS - 1) {
+            throw new Error("RunningHub 图片生成超时，请稍后重试");
+        }
+
+        await delay(RUNNINGHUB_POLL_INTERVAL, options?.signal);
+    }
+
+    throw new Error("RunningHub 图片生成超时，请稍后重试");
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, ms);
+        if (signal) {
+            signal.addEventListener("abort", () => {
+                clearTimeout(timer);
+                reject(new DOMException("Aborted", "AbortError"));
+            }, { once: true });
+        }
+    });
+}
+
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
@@ -656,6 +828,13 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             return await requestGeminiImages(requestConfig, prompt, [], n, options);
         } catch (error) {
             throw new Error(readAxiosError(error, "请求失败"));
+        }
+    }
+    if (requestConfig.apiFormat === "runninghub") {
+        try {
+            return await requestRunningHubImages(requestConfig, prompt, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, "RunningHub 请求失败"));
         }
     }
     const quality = normalizeQuality(config.quality);
@@ -694,6 +873,20 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             return await requestGeminiImages(requestConfig, requestPrompt, references, n, options);
         } catch (error) {
             throw new Error(readAxiosError(error, "请求失败"));
+        }
+    }
+    if (requestConfig.apiFormat === "runninghub") {
+        try {
+            const imageUrls = await Promise.all(
+                references.map(async (image) => {
+                    const dataUrl = await imageToDataUrl(image);
+                    const file = dataUrlToFile({ ...image, dataUrl });
+                    return uploadImageToRunningHub(requestConfig, file, `${image.name || "reference"}.png`);
+                }),
+            );
+            return await requestRunningHubEdit(requestConfig, requestPrompt, imageUrls, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, "RunningHub 图生图失败"));
         }
     }
     const quality = normalizeQuality(config.quality);
@@ -751,6 +944,9 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
                 .map((model) => model.name?.replace(/^models\//, ""))
                 .filter((id): id is string => Boolean(id))
                 .sort((a, b) => a.localeCompare(b));
+        }
+        if (config.apiFormat === "runninghub") {
+            return ["rhart-image-g-2（文生图）", "rhart-image-g-2（图生图）"];
         }
         const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
             headers: {

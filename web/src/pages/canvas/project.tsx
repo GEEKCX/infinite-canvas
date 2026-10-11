@@ -43,6 +43,7 @@ import { useAgentStore } from "@/stores/use-agent-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { applyCanvasAgentOps, type CanvasAgentOp, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { buildCanvasResourceReferences, buildNodeMentionReferences } from "@/lib/canvas/canvas-resource-references";
+import { REVERSE_PROMPT_PRESETS, type ReversePromptPreset } from "@/lib/reverse-prompts";
 import {
     CanvasNodeType,
     type CanvasAssistantImage,
@@ -281,6 +282,8 @@ function InfiniteCanvasPage() {
     const [mouseWorld, setMouseWorld] = useState<Position>({ x: 0, y: 0 });
     const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+    // 反推提示词的预设选择弹窗：点击图片工具栏「反推提示词」先停在这，选完预设再建节点
+    const [reversePromptTarget, setReversePromptTarget] = useState<CanvasNodeData | null>(null);
     const [runningNodeId, setRunningNodeId] = useState<string | null>(null);
     const [isMiniMapOpen, setIsMiniMapOpen] = useState(false);
     const [backgroundMode, setBackgroundMode] = useState<CanvasBackgroundMode>("lines");
@@ -1601,11 +1604,12 @@ function InfiniteCanvasPage() {
     );
 
     const createImageReversePromptNodes = useCallback(
-        (node: CanvasNodeData) => {
+        (node: CanvasNodeData, preset?: ReversePromptPreset) => {
             if (node.type !== CanvasNodeType.Image || !node.metadata?.content) {
                 message.warning("图片节点为空，无法反推提示词");
                 return;
             }
+            const promptBody = preset?.body ?? IMAGE_PROMPT_REVERSE_PRESET;
 
             const gap = 96;
             const textSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
@@ -1615,9 +1619,9 @@ function InfiniteCanvasPage() {
                 ...createCanvasNode(
                     CanvasNodeType.Text,
                     { x: node.position.x + node.width + gap + textSpec.width / 2, y: centerY },
-                    { content: IMAGE_PROMPT_REVERSE_PRESET, prompt: IMAGE_PROMPT_REVERSE_PRESET, status: NODE_STATUS_SUCCESS, fontSize: 14 },
+                    { content: promptBody, prompt: promptBody, status: NODE_STATUS_SUCCESS, fontSize: 14 },
                 ),
-                title: "反推提示词",
+                title: preset?.name ?? "反推提示词",
             };
             const configNode = {
                 ...createCanvasNode(
@@ -1645,6 +1649,15 @@ function InfiniteCanvasPage() {
             setContextMenu(null);
         },
         [effectiveConfig.model, effectiveConfig.textModel, message],
+    );
+
+    const runReversePromptPreset = useCallback(
+        (preset: ReversePromptPreset) => {
+            if (!reversePromptTarget) return;
+            createImageReversePromptNodes(reversePromptTarget, preset);
+            setReversePromptTarget(null);
+        },
+        [createImageReversePromptNodes, reversePromptTarget],
     );
 
     const cropImageNode = useCallback(async (node: CanvasNodeData, crop: CanvasImageCropRect) => {
@@ -2666,7 +2679,7 @@ function InfiniteCanvasPage() {
                     onSuperResolve={(node) => setSuperResolveNodeId(node.id)}
                     onAngle={(node) => setAngleNodeId(node.id)}
                     onViewImage={(node) => setPreviewNodeId(node.id)}
-                    onReversePrompt={createImageReversePromptNodes}
+                    onReversePrompt={(node) => setReversePromptTarget(node)}
                     onRetry={(node) => void handleRetryNode(node)}
                     onToggleFreeResize={(node) => toggleNodeFreeResize(node.id)}
                     onDelete={(node) => deleteNodes(new Set([node.id]))}
@@ -2735,6 +2748,22 @@ function InfiniteCanvasPage() {
 
                 <Modal title="AI 超分" open={Boolean(superResolveNode?.metadata?.content)} centered footer={null} onCancel={() => setSuperResolveNodeId(null)}>
                     <div className="py-8 text-center text-base font-medium">暂未实现</div>
+                </Modal>
+
+                <Modal title="反推提示词 · 选择预设" open={Boolean(reversePromptTarget)} centered footer={null} onCancel={() => setReversePromptTarget(null)} width={560}>
+                    <div className="flex flex-col gap-2 py-2">
+                        {REVERSE_PROMPT_PRESETS.map((preset) => (
+                            <button
+                                key={preset.id}
+                                type="button"
+                                className="rounded-lg border px-3 py-2 text-left transition-opacity hover:opacity-75"
+                                onClick={() => runReversePromptPreset(preset)}
+                            >
+                                <div className="text-sm font-medium">{preset.name}</div>
+                                <div className="mt-1 line-clamp-2 text-xs opacity-50">{preset.body}</div>
+                            </button>
+                        ))}
+                    </div>
                 </Modal>
 
                 {angleNode?.metadata?.content ? <CanvasNodeAngleDialog dataUrl={angleNode.metadata.content} open={Boolean(angleNode)} onClose={() => setAngleNodeId(null)} onConfirm={(params) => void generateAngleNode(angleNode!, params)} /> : null}
