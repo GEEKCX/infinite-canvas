@@ -14,6 +14,8 @@ import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
+import { REVERSE_PROMPT_PRESETS, type ReversePromptPreset } from "@/lib/reverse-prompts";
+import { buildStoryboardPoseSketchPrompt, normalizeStoryboardShots, type StoryboardParams } from "@/lib/storyboard-prompts";
 import { canvasThemes, type CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -30,6 +32,7 @@ import { CanvasNodeAngleDialog, type CanvasImageAngleParams } from "@/components
 import { CanvasNodeCropDialog, type CanvasImageCropRect } from "@/components/canvas/canvas-node-crop-dialog";
 import { CanvasNodeMaskEditDialog, type CanvasImageMaskEditPayload } from "@/components/canvas/canvas-node-mask-edit-dialog";
 import { CanvasNodeSplitDialog, type CanvasImageSplitParams } from "@/components/canvas/canvas-node-split-dialog";
+import { CanvasStoryboardDialog } from "@/components/canvas/canvas-storyboard-dialog";
 import { CanvasNodeUpscaleDialog, type CanvasImageUpscaleParams } from "@/components/canvas/canvas-node-upscale-dialog";
 import { buildNodeGenerationContext, buildNodeGenerationInputs, buildNodeResponseMessages, hydrateNodeGenerationContext, type NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import { CanvasNodeHoverToolbar, CanvasNodeInfoModal } from "@/components/canvas/canvas-node-hover-toolbar";
@@ -241,6 +244,9 @@ function InfiniteCanvasPage() {
     const [mouseWorld, setMouseWorld] = useState<Position>({ x: 0, y: 0 });
     const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+    // 反推提示词的预设选择弹窗：点击图片工具栏「反推提示词」先停在这，选完预设再建节点
+    const [reversePromptTarget, setReversePromptTarget] = useState<CanvasNodeData | null>(null);
+    const [storyboardTarget, setStoryboardTarget] = useState<CanvasNodeData | null>(null);
     const [nodeCreatePosition, setNodeCreatePosition] = useState<Position | null>(null);
     const [runningNodeId, setRunningNodeId] = useState<string | null>(null);
     const [isMiniMapOpen, setIsMiniMapOpen] = useState(false);
@@ -1890,19 +1896,20 @@ function InfiniteCanvasPage() {
     );
 
     const createImageReversePromptNodes = useCallback(
-        (node: CanvasNodeData) => {
+        (node: CanvasNodeData, preset?: ReversePromptPreset) => {
             if (node.type !== CanvasNodeType.Image || !node.metadata?.content) {
                 message.warning(t("canvas.projectPage.emptyReverse"));
                 return;
             }
+            const promptBody = preset?.body ?? t("canvas.projectPage.reversePreset");
 
             const gap = 96;
             const textSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
             const configSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Config];
             const centerY = node.position.y + node.height / 2;
             const textNode = {
-                ...createCanvasNode(CanvasNodeType.Text, { x: node.position.x + node.width + gap + textSpec.width / 2, y: centerY }, { content: t("canvas.projectPage.reversePreset"), prompt: t("canvas.projectPage.reversePreset"), status: NODE_STATUS_SUCCESS, fontSize: 14 }),
-                title: t("canvas.projectPage.reverseTitle"),
+                ...createCanvasNode(CanvasNodeType.Text, { x: node.position.x + node.width + gap + textSpec.width / 2, y: centerY }, { content: promptBody, prompt: promptBody, status: NODE_STATUS_SUCCESS, fontSize: 14 }),
+                title: preset?.name ?? t("canvas.projectPage.reverseTitle"),
             };
             const configNode = {
                 ...createCanvasNode(
@@ -1926,6 +1933,15 @@ function InfiniteCanvasPage() {
             setContextMenu(null);
         },
         [effectiveConfig.model, effectiveConfig.textModel, message, t],
+    );
+
+    const runReversePromptPreset = useCallback(
+        (preset: ReversePromptPreset) => {
+            if (!reversePromptTarget) return;
+            createImageReversePromptNodes(reversePromptTarget, preset);
+            setReversePromptTarget(null);
+        },
+        [createImageReversePromptNodes, reversePromptTarget],
     );
 
     const cropImageNode = useCallback(async (node: CanvasNodeData, crop: CanvasImageCropRect) => {
@@ -2138,6 +2154,84 @@ function InfiniteCanvasPage() {
             }
         },
         [effectiveConfig, finishGenerationRequest, openConfigDialog, startGenerationRequest, t],
+    );
+
+    const createStoryboardNodes = useCallback(
+        async (node: CanvasNodeData, params: StoryboardParams) => {
+            if (node.type !== CanvasNodeType.Image || !node.metadata?.content) return;
+            const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
+            if (!isAiConfigReady(generationConfig, generationConfig.model)) {
+                openConfigDialog(true);
+                return;
+            }
+            setStoryboardTarget(null);
+            const reference = { id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey };
+            // 姿势模式先把原图降维成姿势线稿，线稿替代原图进入逐镜请求，避免原图画风污染分镜
+            let shotReference = reference;
+            if (params.keepPose) {
+                const sketchController = startGenerationRequest(node.id, node.id, node.id);
+                setRunningNodeId(node.id);
+                try {
+                    const sketch = await requestEdit(generationConfig, buildStoryboardPoseSketchPrompt(), [reference], { signal: sketchController.signal }).then((items) => items[0]);
+                    const uploaded = await uploadImage(sketch.dataUrl, { signal: sketchController.signal });
+                    shotReference = { id: `${node.id}-pose-sketch`, name: "pose-sketch.png", type: uploaded.mimeType || "image/png", dataUrl: sketch.dataUrl, storageKey: uploaded.storageKey };
+                } catch (error) {
+                    if (isGenerationCanceled(error)) return;
+                    message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
+                    return;
+                } finally {
+                    finishGenerationRequest(node.id, sketchController);
+                    setRunningNodeId(null);
+                }
+            }
+            const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
+            const gap = 24;
+            const shots = normalizeStoryboardShots(params);
+            const shotNodeIds = shots.map(() => nanoid());
+            const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, [shotReference]);
+            const shotNodes: CanvasNodeData[] = shots.map((shot, index) => ({
+                id: shotNodeIds[index],
+                type: CanvasNodeType.Image,
+                title: `${t("canvas.projectPage.storyboardNodeTitle")} ${shot.index}`,
+                position: { x: node.position.x + node.width + 96 + index * (imageConfig.width + gap), y: node.position.y },
+                width: imageConfig.width,
+                height: imageConfig.height,
+                metadata: { prompt: shot.prompt, status: NODE_STATUS_LOADING, ...generationMetadata },
+            }));
+            setNodes((prev) => [...prev, ...shotNodes]);
+            setConnections((prev) => [...prev, ...shotNodes.map((child) => ({ id: nanoid(), fromNodeId: node.id, toNodeId: child.id }))]);
+            setSelectedNodeIds(new Set(shotNodeIds));
+            setSelectedConnectionId(null);
+            setRunningNodeId(shotNodeIds[0]);
+            await Promise.allSettled(
+                shots.map(async (shot, index) => {
+                    const shotNodeId = shotNodeIds[index];
+                    const controller = startGenerationRequest(shotNodeId, node.id, shotNodeId);
+                    try {
+                        const image = await requestEdit(generationConfig, shot.prompt, [shotReference], { signal: controller.signal }).then((items) => items[0]);
+                        const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
+                        const size = fitNodeSize(uploaded.width, uploaded.height, imageConfig.width, imageConfig.height);
+                        setNodes((prev) => prev.map((item) => (item.id === shotNodeId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt: shot.prompt, ...generationMetadata } } : item)));
+                    } catch (error) {
+                        if (isGenerationCanceled(error)) return;
+                        const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
+                        setNodes((prev) => prev.map((item) => (item.id === shotNodeId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
+                    } finally {
+                        finishGenerationRequest(shotNodeId, controller);
+                    }
+                }),
+            );
+            setRunningNodeId(null);
+        },
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+    );
+
+    const runStoryboard = useCallback(
+        (params: StoryboardParams) => {
+            if (!storyboardTarget) return;
+            void createStoryboardNodes(storyboardTarget, params);
+        },
+        [createStoryboardNodes, storyboardTarget],
     );
 
     const handleFontSizeChange = useCallback((nodeId: string, fontSize: number) => {
@@ -3340,7 +3434,8 @@ function InfiniteCanvasPage() {
                     onSuperResolve={(node) => setSuperResolveNodeId(node.id)}
                     onAngle={(node) => setAngleNodeId(node.id)}
                     onViewImage={handleNodeViewImage}
-                    onReversePrompt={createImageReversePromptNodes}
+                    onReversePrompt={(node) => setReversePromptTarget(node)}
+                    onStoryboard={(node) => setStoryboardTarget(node)}
                     onRetry={(node) => void handleRetryNode(node)}
                     onToggleFreeResize={(node) => toggleNodeFreeResize(node.id)}
                     onDelete={(node) => deleteNodes(new Set([node.id]))}
@@ -3438,7 +3533,25 @@ function InfiniteCanvasPage() {
                     <div className="py-8 text-center text-base font-medium">{t("canvas.projectPage.notImplemented")}</div>
                 </Modal>
 
+                <Modal title="反推提示词 · 选择预设" open={Boolean(reversePromptTarget)} centered footer={null} onCancel={() => setReversePromptTarget(null)} width={560}>
+                    <div className="flex flex-col gap-2 py-2">
+                        {REVERSE_PROMPT_PRESETS.map((preset) => (
+                            <button
+                                key={preset.id}
+                                type="button"
+                                className="rounded-lg border px-3 py-2 text-left transition-opacity hover:opacity-75"
+                                onClick={() => runReversePromptPreset(preset)}
+                            >
+                                <div className="text-sm font-medium">{preset.name}</div>
+                                <div className="mt-1 line-clamp-2 text-xs opacity-50">{preset.body}</div>
+                            </button>
+                        ))}
+                    </div>
+                </Modal>
+
                 {angleNode?.metadata?.content ? <CanvasNodeAngleDialog dataUrl={angleNode.metadata.content} open={Boolean(angleNode)} onClose={() => setAngleNodeId(null)} onConfirm={(params) => void generateAngleNode(angleNode!, params)} /> : null}
+
+                <CanvasStoryboardDialog open={Boolean(storyboardTarget)} onClose={() => setStoryboardTarget(null)} onConfirm={runStoryboard} />
 
                 <Modal
                     title={t("canvas.projectPage.imageDetails")}

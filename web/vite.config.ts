@@ -50,4 +50,15 @@ export default defineConfig({
         __APP_VERSION__: JSON.stringify(localVersion),
         __APP_RELEASES__: JSON.stringify(parseChangelog(localChangelog)),
     },
+    // 本机 Magpie 网关代理：Base URL 填 http://localhost:3000/magpie/v1 即可，
+    // 同源转发绕开网关没有 CORS 的问题（网关 127.0.0.1:3425 只服务本机 CLI）
+    server: {
+        proxy: {
+            "/magpie": {
+                target: "http://127.0.0.1:3425",
+                changeOrigin: true,
+                rewrite: (path) => path.replace(/^\/magpie/, ""),
+            },
+        },
+    },
 });
