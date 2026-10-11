@@ -1,10 +1,10 @@
 import type { ReactNode } from "react";
-import { Brush, Camera, Copy, FileText, Film, Grid2x2, Lock, LockOpen, Maximize2, Scissors, Sparkles, Upload, ZoomIn } from "lucide-react";
+import { Brush, Camera, Copy, FileText, Film, Grid2x2, Lock, LockOpen, Maximize2, PersonStanding, Scissors, Sparkles, Upload, ZoomIn } from "lucide-react";
 
 import type { CanvasNodeData } from "@/types/canvas";
 import i18n from "@/i18n";
 
-export type ImageNodeActionToolId = "copyPrompt" | "reversePrompt" | "storyboard" | "replace" | "resize" | "maskEdit" | "crop" | "split" | "upscale" | "superResolve" | "angle" | "view";
+export type ImageNodeActionToolId = "copyPrompt" | "reversePrompt" | "storyboard" | "poseReplicate" | "replace" | "resize" | "maskEdit" | "crop" | "split" | "upscale" | "superResolve" | "angle" | "view";
 export type ImageQuickToolId = "info" | "delete" | "saveAsset" | "download" | ImageNodeActionToolId;
 
 export type ImageToolHandlers = {
@@ -20,6 +20,7 @@ export type ImageToolHandlers = {
     onCopyPrompt: (node: CanvasNodeData) => void;
     onReversePrompt: (node: CanvasNodeData) => void;
     onStoryboard: (node: CanvasNodeData) => void;
+    onPoseReplicate: (node: CanvasNodeData) => void;
 };
 
 export type ImageToolDefinition = {
@@ -37,7 +38,7 @@ export type ImageQuickToolsConfig = {
     showLabels: boolean;
 };
 
-export const IMAGE_QUICK_TOOLS_STORAGE_KEY = "canvas-image-quick-tools-v8";
+export const IMAGE_QUICK_TOOLS_STORAGE_KEY = "canvas-image-quick-tools-v9";
 
 const defaultBaseToolIds: ImageQuickToolId[] = ["info", "delete", "saveAsset", "download"];
 
@@ -65,6 +66,14 @@ export const imageToolDefinitions: ImageToolDefinition[] = [
         title: () => i18n.t("canvas.imageTools.storyboardTitle"),
         icon: () => <Film className="size-4" />,
         run: (node, handlers) => handlers.onStoryboard(node),
+    },
+    {
+        id: "poseReplicate",
+        defaultVisible: true,
+        label: () => i18n.t("canvas.imageTools.poseReplicate"),
+        title: () => i18n.t("canvas.imageTools.poseReplicateTitle"),
+        icon: () => <PersonStanding className="size-4" />,
+        run: (node, handlers) => handlers.onPoseReplicate(node),
     },
     {
         id: "replace",

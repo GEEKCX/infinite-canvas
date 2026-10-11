@@ -16,6 +16,7 @@ import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { REVERSE_PROMPT_PRESETS, type ReversePromptPreset } from "@/lib/reverse-prompts";
 import { buildStoryboardPoseSketchPrompt, normalizeStoryboardShots, type StoryboardParams } from "@/lib/storyboard-prompts";
+import { buildPoseReplicatePrompt, type PoseReplicateParams } from "@/lib/pose-replicate-prompts";
 import { canvasThemes, type CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -33,6 +34,7 @@ import { CanvasNodeCropDialog, type CanvasImageCropRect } from "@/components/can
 import { CanvasNodeMaskEditDialog, type CanvasImageMaskEditPayload } from "@/components/canvas/canvas-node-mask-edit-dialog";
 import { CanvasNodeSplitDialog, type CanvasImageSplitParams } from "@/components/canvas/canvas-node-split-dialog";
 import { CanvasStoryboardDialog } from "@/components/canvas/canvas-storyboard-dialog";
+import { CanvasPoseReplicateDialog } from "@/components/canvas/canvas-pose-replicate-dialog";
 import { CanvasNodeUpscaleDialog, type CanvasImageUpscaleParams } from "@/components/canvas/canvas-node-upscale-dialog";
 import { buildNodeGenerationContext, buildNodeGenerationInputs, buildNodeResponseMessages, hydrateNodeGenerationContext, type NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import { CanvasNodeHoverToolbar, CanvasNodeInfoModal } from "@/components/canvas/canvas-node-hover-toolbar";
@@ -247,6 +249,7 @@ function InfiniteCanvasPage() {
     // 反推提示词的预设选择弹窗：点击图片工具栏「反推提示词」先停在这，选完预设再建节点
     const [reversePromptTarget, setReversePromptTarget] = useState<CanvasNodeData | null>(null);
     const [storyboardTarget, setStoryboardTarget] = useState<CanvasNodeData | null>(null);
+    const [poseReplicateTarget, setPoseReplicateTarget] = useState<CanvasNodeData | null>(null);
     const [nodeCreatePosition, setNodeCreatePosition] = useState<Position | null>(null);
     const [runningNodeId, setRunningNodeId] = useState<string | null>(null);
     const [isMiniMapOpen, setIsMiniMapOpen] = useState(false);
@@ -2226,12 +2229,82 @@ function InfiniteCanvasPage() {
         [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
     );
 
+    const createPoseReplicateNode = useCallback(
+        async (node: CanvasNodeData, params: PoseReplicateParams) => {
+            if (node.type !== CanvasNodeType.Image || !node.metadata?.content) return;
+            const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
+            if (!isAiConfigReady(generationConfig, generationConfig.model)) {
+                openConfigDialog(true);
+                return;
+            }
+            setPoseReplicateTarget(null);
+            const reference = { id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey };
+            // 先把原图降维成姿势线稿，线稿作为唯一参考图，避免原图画风污染结果
+            const sketchController = startGenerationRequest(node.id, node.id, node.id);
+            setRunningNodeId(node.id);
+            let sketchReference = reference;
+            try {
+                const sketch = await requestEdit(generationConfig, buildStoryboardPoseSketchPrompt(), [reference], { signal: sketchController.signal }).then((items) => items[0]);
+                const uploaded = await uploadImage(sketch.dataUrl, { signal: sketchController.signal });
+                sketchReference = { id: `${node.id}-pose-sketch`, name: "pose-sketch.png", type: uploaded.mimeType || "image/png", dataUrl: sketch.dataUrl, storageKey: uploaded.storageKey };
+            } catch (error) {
+                if (isGenerationCanceled(error)) return;
+                message.error(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
+                return;
+            } finally {
+                finishGenerationRequest(node.id, sketchController);
+                setRunningNodeId(null);
+            }
+            const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
+            const prompt = buildPoseReplicatePrompt(params);
+            const resultNodeId = nanoid();
+            const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, [sketchReference]);
+            const resultNode: CanvasNodeData = {
+                id: resultNodeId,
+                type: CanvasNodeType.Image,
+                title: t("canvas.projectPage.poseReplicateNodeTitle"),
+                position: { x: node.position.x + node.width + 96, y: node.position.y },
+                width: imageConfig.width,
+                height: imageConfig.height,
+                metadata: { prompt, status: NODE_STATUS_LOADING, ...generationMetadata },
+            };
+            setNodes((prev) => [...prev, resultNode]);
+            setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: node.id, toNodeId: resultNodeId }]);
+            setSelectedNodeIds(new Set([resultNodeId]));
+            setSelectedConnectionId(null);
+            setRunningNodeId(resultNodeId);
+            const controller = startGenerationRequest(resultNodeId, node.id, resultNodeId);
+            try {
+                const image = await requestEdit(generationConfig, prompt, [sketchReference], { signal: controller.signal }).then((items) => items[0]);
+                const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
+                const size = fitNodeSize(uploaded.width, uploaded.height, imageConfig.width, imageConfig.height);
+                setNodes((prev) => prev.map((item) => (item.id === resultNodeId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
+            } catch (error) {
+                if (isGenerationCanceled(error)) return;
+                const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
+                setNodes((prev) => prev.map((item) => (item.id === resultNodeId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
+            } finally {
+                finishGenerationRequest(resultNodeId, controller);
+            }
+            setRunningNodeId(null);
+        },
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+    );
+
     const runStoryboard = useCallback(
         (params: StoryboardParams) => {
             if (!storyboardTarget) return;
             void createStoryboardNodes(storyboardTarget, params);
         },
         [createStoryboardNodes, storyboardTarget],
+    );
+
+    const runPoseReplicate = useCallback(
+        (params: PoseReplicateParams) => {
+            if (!poseReplicateTarget) return;
+            void createPoseReplicateNode(poseReplicateTarget, params);
+        },
+        [createPoseReplicateNode, poseReplicateTarget],
     );
 
     const handleFontSizeChange = useCallback((nodeId: string, fontSize: number) => {
@@ -3436,6 +3509,7 @@ function InfiniteCanvasPage() {
                     onViewImage={handleNodeViewImage}
                     onReversePrompt={(node) => setReversePromptTarget(node)}
                     onStoryboard={(node) => setStoryboardTarget(node)}
+                    onPoseReplicate={(node) => setPoseReplicateTarget(node)}
                     onRetry={(node) => void handleRetryNode(node)}
                     onToggleFreeResize={(node) => toggleNodeFreeResize(node.id)}
                     onDelete={(node) => deleteNodes(new Set([node.id]))}
@@ -3552,6 +3626,7 @@ function InfiniteCanvasPage() {
                 {angleNode?.metadata?.content ? <CanvasNodeAngleDialog dataUrl={angleNode.metadata.content} open={Boolean(angleNode)} onClose={() => setAngleNodeId(null)} onConfirm={(params) => void generateAngleNode(angleNode!, params)} /> : null}
 
                 <CanvasStoryboardDialog open={Boolean(storyboardTarget)} onClose={() => setStoryboardTarget(null)} onConfirm={runStoryboard} />
+                <CanvasPoseReplicateDialog open={Boolean(poseReplicateTarget)} onClose={() => setPoseReplicateTarget(null)} onConfirm={runPoseReplicate} />
 
                 <Modal
                     title={t("canvas.projectPage.imageDetails")}
